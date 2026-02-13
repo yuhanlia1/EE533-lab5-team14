@@ -1,0 +1,211 @@
+#!/usr/bin/perl -w
+# idsreg - Control script for Custom IDS with State-Aware Logic Analyzer
+# Based on synthesized register map provided by user
+
+use lib "/usr/local/netfpga/lib/Perl5";
+use strict;
+use warnings;
+
+###############################################################################
+# Register Definitions
+# [SOURCE: Derived directly from your reg_defines.h screenshot]
+###############################################################################
+# commands:
+# ./idsreg reset:
+# ./idsreg matches: 
+# ./idsreg pattern <string>:
+# ./idsreg ladump [number]: 导出逻辑分析仪（Logic Analyzer）捕获的数据。
+# ./idsreg status: 即 idsreg allregs
+
+# --- Software Registers (Write Only) ---
+# 用于设置匹配模式和控制命令
+my $IDS_PATTERN_HI_REG      = 0x2000300;  # IDS_PATTERN_HIGH_REG
+my $IDS_PATTERN_LO_REG      = 0x2000304;  # IDS_PATTERN_LOW_REG
+my $IDS_COMMAND_REG         = 0x2000308;  # IDS_IDS_CMD_REG
+my $IDS_LA_READPTR_REG      = 0x200030c;  # IDS_TRACE_R_ADDR_REG
+
+# --- Hardware Registers (Read Only) ---
+# 用于读取匹配计数和 Logic Analyzer 数据
+my $IDS_MATCHES_REG         = 0x2000310;  # IDS_MATCHES_REG
+my $IDS_LA_DATA_LO_REG      = 0x2000314;  # IDS_TRACE_OUT_DATA_LO_REG
+my $IDS_LA_DATA_HI_REG      = 0x2000318;  # IDS_TRACE_OUT_DATA_HI_REG
+my $IDS_LA_DEBUG_REG        = 0x200031c;  # IDS_TRACE_OUT_DEBUG_REG
+
+###############################################################################
+# Helper Functions
+###############################################################################
+
+# Wrapper for the NetFPGA regwrite command
+sub regwrite {
+   my ($addr, $value) = @_;
+   # Call the system command
+   my $cmd = sprintf("regwrite 0x%08x 0x%08x", $addr, $value);
+   system($cmd) == 0 or die "Failed to execute: $cmd\n";
+}
+
+# Wrapper for the NetFPGA regread command
+sub regread {
+   my ($addr) = @_;
+   my $cmd = sprintf("regread 0x%08x", $addr);
+   my $output = `$cmd`;
+   
+   # Parse output format: "Reg 0x2000300 (33555200): 0x00000000 (0)"
+   if ($output =~ /0x[0-9a-fA-F]+\s+\(\d+\):\s+(0x[0-9a-fA-F]+)/) {
+      return hex($1);
+   } elsif ($output =~ /(0x[0-9a-fA-F]+)/) {
+      # Fallback simple format
+      return hex($1);
+   }
+   return 0;
+}
+
+sub ids_reset {
+   # Bit 0: Reset counters
+   # Bit 1: Reset Logic Analyzer Pointers
+   print "Resetting IDS counters and LA pointers...\n";
+   regwrite($IDS_COMMAND_REG, 0x3); 
+   regwrite($IDS_COMMAND_REG, 0x0);
+}
+
+sub write_pattern {
+   my ($str) = @_;
+   my @chars = split(//, $str);
+   my @ints = map { ord($_) } @chars;
+   
+   # Logic to pack 7 bytes + mask into two 32-bit registers
+   my $validBytes = scalar(@ints);
+   if ($validBytes > 7) { $validBytes = 7; }
+   
+   my $hi = 0;
+   my $lo = 0;
+   
+   for (my $i = 0; $i < 7; $i++) {
+      if ($i < $validBytes) {
+         # Set mask bit (Bits 30-24 of High Reg) to indicate valid byte
+         my $mask_bit = 1 << (6 - $i);
+         $hi |= ($mask_bit << 24);
+         
+         if ($i <= 2) {
+            # Bytes 0,1,2 go into High Reg
+            $hi |= ($ints[$i] << (8 * (2 - $i)));
+         } else {
+            # Bytes 3,4,5,6 go into Low Reg
+            my $pos = $i - 3;
+            $lo |= ($ints[$i] << (8 * (3 - $pos)));
+         }
+      }
+   }
+   
+   printf("Writing Pattern: '%s'\n", $str);
+   printf("  Writing HI (0x%x): 0x%08x\n", $IDS_PATTERN_HI_REG, $hi);
+   printf("  Writing LO (0x%x): 0x%08x\n", $IDS_PATTERN_LO_REG, $lo);
+   
+   regwrite($IDS_PATTERN_HI_REG, $hi);
+   regwrite($IDS_PATTERN_LO_REG, $lo);
+}
+
+###############################################################################
+# Logic Analyzer (LA) Functions
+###############################################################################
+
+# Helper to decode the FSM state number into text
+sub parse_state {
+    my ($s) = @_;
+    if ($s == 0) { return "START  "; }
+    if ($s == 1) { return "HEADER "; }
+    if ($s == 2) { return "PAYLOAD"; }
+    return "UNK($s) ";
+}
+
+sub dump_la {
+   my ($count) = @_;
+   if (!defined($count)) { $count = 20; } # Default show 20 entries
+
+   print "\n=== Custom Logic Analyzer Dump ===\n";
+   print "Idx | State   | H_Cnt | Match | Data (Hex 64-bit)   | ASCII Preview\n";
+   print "----|---------|-------|-------|---------------------|---------------\n";
+
+   for (my $i = 0; $i < $count; $i++) {
+      # 1. Tell Hardware which row we want to read
+      regwrite($IDS_LA_READPTR_REG, $i);
+      
+      # 2. Read the split data from Hardware Registers
+      # Note: We must read the registers mapped to your screenshot
+      my $dbg = regread($IDS_LA_DEBUG_REG);
+      my $hi  = regread($IDS_LA_DATA_HI_REG);
+      my $lo  = regread($IDS_LA_DATA_LO_REG);
+      
+      # 3. Parse Debug Register
+      # Based on Verilog: {24'b0, match(1), header_cnt(3), state(2)}
+      my $state = $dbg & 0x3;          # Bits [1:0]
+      my $h_cnt = ($dbg >> 2) & 0x7;   # Bits [4:2]
+      my $match = ($dbg >> 5) & 0x1;   # Bit  [5]
+      
+      # 4. Format Data for Display
+      # Convert Hex to ASCII for easier readability
+      my $ascii = "";
+      # Process High 32-bits
+      for (my $b=3; $b>=0; $b--) {
+          my $byte = ($hi >> ($b*8)) & 0xFF;
+          $ascii .= ($byte >= 32 && $byte <= 126) ? chr($byte) : ".";
+      }
+      # Process Low 32-bits
+      for (my $b=3; $b>=0; $b--) {
+          my $byte = ($lo >> ($b*8)) & 0xFF;
+          $ascii .= ($byte >= 32 && $byte <= 126) ? chr($byte) : ".";
+      }
+
+      printf("%3d | %s |   %d   |   %d   | %08x_%08x | %s\n", 
+             $i, parse_state($state), $h_cnt, $match, $hi, $lo, $ascii);
+   }
+   print "----------------------------------\n";
+}
+
+###############################################################################
+# Main Execution Block
+###############################################################################
+
+sub usage {
+   print "Usage: idsreg <cmd> [options]\n";
+   print "Commands:\n";
+   print "  reset              Reset matches counter & LA pointers\n";
+   print "  matches            Read matches counter\n";
+   print "  pattern <str>      Set 7-byte matching pattern (e.g., 'badcode')\n";
+   print "  ladump [N]         Dump first N entries of Logic Analyzer (default 20)\n";
+   print "  status             Show raw register values\n";
+}
+
+if (scalar(@ARGV) < 1) {
+   usage();
+   exit 1;
+}
+
+my $cmd = $ARGV[0];
+
+if ($cmd eq "reset") {
+   ids_reset();
+} 
+elsif ($cmd eq "matches") {
+   my $val = regread($IDS_MATCHES_REG);
+   print "Total Matches Dropped: $val\n";
+} 
+elsif ($cmd eq "pattern") {
+   if (scalar(@ARGV) < 2) { die "Error: Missing pattern string.\n"; }
+   write_pattern($ARGV[1]);
+} 
+elsif ($cmd eq "ladump") {
+   my $n = $ARGV[1];
+   dump_la($n);
+} 
+elsif ($cmd eq "status") {
+   printf("--- Register Status ---\n");
+   printf("Matches (0x%x): %d\n", $IDS_MATCHES_REG, regread($IDS_MATCHES_REG));
+   printf("Cmd     (0x%x): 0x%08x\n", $IDS_COMMAND_REG, regread($IDS_COMMAND_REG));
+   printf("Pat Hi  (0x%x): 0x%08x\n", $IDS_PATTERN_HI_REG, regread($IDS_PATTERN_HI_REG));
+   printf("Pat Lo  (0x%x): 0x%08x\n", $IDS_PATTERN_LO_REG, regread($IDS_PATTERN_LO_REG));
+} 
+else {
+   print "Unknown command: $cmd\n";
+   usage();
+   exit 1;
+}

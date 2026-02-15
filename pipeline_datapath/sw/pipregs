@@ -1,0 +1,190 @@
+#!/usr/bin/perl -w
+use lib "/usr/local/netfpga/lib/Perl5";
+use strict;
+
+my $SW_IMEM_CTRL_REG      = 0x2000340;
+my $SW_IMEM_WRITE_REG     = 0x2000344;
+my $SW_IMEM_ADDR_REG      = 0x2000348;
+my $SW_IMEM_WDATA_REG     = 0x200034c;
+
+my $SW_DMEM_CTRL_REG      = 0x2000350;
+my $SW_DMEM_WRITE_REG     = 0x2000354;
+my $SW_DMEM_ADDR_REG      = 0x2000358;
+my $SW_DMEM_WDATA_LO_REG  = 0x200035c;
+my $SW_DMEM_WDATA_HI_REG  = 0x2000360;
+
+my $HW_IMEM_RDATA_REG     = 0x2000364;
+my $HW_DMEM_R_LO_REG      = 0x2000368;
+my $HW_DMEM_R_HI_REG      = 0x200036c;
+
+sub regwrite {
+   my( $addr, $value ) = @_;
+   my $cmd = sprintf( "regwrite $addr 0x%08x", $value );
+   `$cmd`;
+}
+
+sub regread {
+   my( $addr ) = @_;
+   my $cmd = sprintf( "regread $addr" );
+   my @out = `$cmd`;
+   my $result = $out[0];
+   if ( $result =~ m/Reg (0x[0-9a-f]+) \((\d+)\):\s+(0x[0-9a-f]+) \((\d+)\)/ ) {
+      $result = $3;
+   }
+   return $result;
+}
+
+sub hex32_to_int {
+   my($s) = @_;
+   $s =~ s/_//g;
+   if ($s =~ /^0x/i) { return hex($s); }
+   return hex("0x$s");
+}
+
+sub parse_u64_to_hi_lo {
+   my($s) = @_;
+   $s =~ s/_//g;
+   $s =~ s/^0x//i;
+   $s = lc($s);
+   $s = sprintf("%016s", $s);
+   $s =~ s/ /0/g;
+
+   my $hi_str = substr($s, 0, 8);
+   my $lo_str = substr($s, 8, 8);
+
+   my $hi = hex("0x$hi_str");
+   my $lo = hex("0x$lo_str");
+   return ($hi, $lo);
+}
+
+sub freeze_core {
+   regwrite($SW_IMEM_CTRL_REG, 0x1);
+   regwrite($SW_DMEM_CTRL_REG, 0x1);
+}
+
+sub unfreeze_core {
+   regwrite($SW_IMEM_CTRL_REG,  0x0);
+   regwrite($SW_DMEM_CTRL_REG,  0x0);
+   regwrite($SW_IMEM_WRITE_REG, 0x0);
+   regwrite($SW_DMEM_WRITE_REG, 0x0);
+}
+
+sub imem_set_addr {
+   my($addr) = @_;
+   regwrite($SW_IMEM_ADDR_REG, $addr & 0xffffffff);
+}
+
+sub imem_write_word {
+   my($addr, $inst32) = @_;
+   regwrite($SW_IMEM_CTRL_REG, 0x1);
+   imem_set_addr($addr);
+   regwrite($SW_IMEM_WDATA_REG, $inst32 & 0xffffffff);
+   regwrite($SW_IMEM_WRITE_REG, 0x1);
+   regwrite($SW_IMEM_WRITE_REG, 0x0);
+}
+
+sub imem_read_word {
+   my($addr) = @_;
+   regwrite($SW_IMEM_CTRL_REG, 0x1);
+   imem_set_addr($addr);
+   regwrite($SW_IMEM_WRITE_REG, 0x0);
+   return regread($HW_IMEM_RDATA_REG);
+}
+
+sub dmem_set_addr {
+   my($addr) = @_;
+   regwrite($SW_DMEM_ADDR_REG, $addr & 0xffffffff);
+}
+
+sub dmem_write_qword {
+   my($addr, $data64_str) = @_;
+   my($hi, $lo) = parse_u64_to_hi_lo($data64_str);
+
+   regwrite($SW_DMEM_CTRL_REG, 0x1);
+   dmem_set_addr($addr);
+
+   regwrite($SW_DMEM_WDATA_LO_REG, $lo);
+   regwrite($SW_DMEM_WDATA_HI_REG, $hi);
+
+   regwrite($SW_DMEM_WRITE_REG, 0x1);
+   regwrite($SW_DMEM_WRITE_REG, 0x0);
+}
+
+sub dmem_read_qword {
+   my($addr) = @_;
+   regwrite($SW_DMEM_CTRL_REG, 0x1);
+   dmem_set_addr($addr);
+   regwrite($SW_DMEM_WRITE_REG, 0x0);
+
+   my $lo = regread($HW_DMEM_R_LO_REG);
+   my $hi = regread($HW_DMEM_R_HI_REG);
+
+   my $lo_i = hex32_to_int($lo);
+   my $hi_i = hex32_to_int($hi);
+   return sprintf("0x%08x%08x", $hi_i, $lo_i);
+}
+
+sub dump_allregs {
+   print "SW_IMEM_CTRL      : ", regread($SW_IMEM_CTRL_REG), "\n";
+   print "SW_IMEM_WRITE     : ", regread($SW_IMEM_WRITE_REG), "\n";
+   print "SW_IMEM_ADDR      : ", regread($SW_IMEM_ADDR_REG), "\n";
+   print "SW_IMEM_WDATA     : ", regread($SW_IMEM_WDATA_REG), "\n";
+   print "SW_DMEM_CTRL      : ", regread($SW_DMEM_CTRL_REG), "\n";
+   print "SW_DMEM_WRITE     : ", regread($SW_DMEM_WRITE_REG), "\n";
+   print "SW_DMEM_ADDR      : ", regread($SW_DMEM_ADDR_REG), "\n";
+   print "SW_DMEM_WDATA_LO  : ", regread($SW_DMEM_WDATA_LO_REG), "\n";
+   print "SW_DMEM_WDATA_HI  : ", regread($SW_DMEM_WDATA_HI_REG), "\n";
+   print "HW_IMEM_RDATA     : ", regread($HW_IMEM_RDATA_REG), "\n";
+   print "HW_DMEM_R_DATA_LO : ", regread($HW_DMEM_R_LO_REG), "\n";
+   print "HW_DMEM_R_DATA_HI : ", regread($HW_DMEM_R_HI_REG), "\n";
+}
+
+sub usage {
+   print "Usage: pipregs <cmd> <options>\n";
+   print "  freeze\n";
+   print "  unfreeze\n";
+   print "  imem_write <addr> <inst32>\n";
+   print "  imem_read  <addr>\n";
+   print "  dmem_write <addr> <data64>\n";
+   print "  dmem_read  <addr>\n";
+   print "  allregs\n";
+}
+
+my $numargs = $#ARGV + 1;
+if ($numargs < 1) { usage(); exit(1); }
+
+my $cmd = $ARGV[0];
+
+if ($cmd eq "freeze") {
+   freeze_core();
+} elsif ($cmd eq "unfreeze") {
+   unfreeze_core();
+} elsif ($cmd eq "imem_write") {
+   if ($numargs < 3) { usage(); exit(1); }
+   my $addr  = hex32_to_int($ARGV[1]);
+   my $inst  = hex32_to_int($ARGV[2]);
+   imem_write_word($addr, $inst);
+   printf("IMEM[%d] <= 0x%08x\n", $addr, $inst);
+} elsif ($cmd eq "imem_read") {
+   if ($numargs < 2) { usage(); exit(1); }
+   my $addr = hex32_to_int($ARGV[1]);
+   my $val  = imem_read_word($addr);
+   print "IMEM[$addr] = $val\n\n";
+} elsif ($cmd eq "dmem_write") {
+   if ($numargs < 3) { usage(); exit(1); }
+   my $addr = hex32_to_int($ARGV[1]);
+   my $data = $ARGV[2];
+   dmem_write_qword($addr, $data);
+   print "DMEM[$addr] <= $data\n\n";
+} elsif ($cmd eq "dmem_read") {
+   if ($numargs < 2) { usage(); exit(1); }
+   my $addr = hex32_to_int($ARGV[1]);
+   my $val  = dmem_read_qword($addr);
+   print "DMEM[$addr] = $val\n\n";
+} elsif ($cmd eq "allregs") {
+   dump_allregs();
+} else {
+   print "Unrecognized command $cmd\n";
+   usage();
+   exit(1);
+}
